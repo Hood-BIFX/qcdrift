@@ -1,0 +1,451 @@
+---
+title: "qcdrift: Comprehensive Line-by-Line Technical Manual and Tutorial"
+author: "Jamilet Cordon"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{qcdrift-extended-guide}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## 1. Complete Chronological Data Lifecycle Architecture
+
+This tutorial details exactly how high-dimensional mass spectrometry data moves through the `qcdrift` package. Rather than treating functions as isolated wrappers, this guide shows you how your data frame changes shape, column names, and numeric states across every file module in the repository.
+
+### 1.1 Global Pipeline Architecture
+
+High-dimensional mass spectrometry (MS) data sets are inherently prone to systematic artifacts. These are caused by target signal dropouts (analytically drift) over long injection sequences and sample concentration variances (dilution effects). The 'qcdrift' package resolves these variation using a chronological, modular processing layout.
+
+```{text}
+
+[Raw Matrix Input Source]  --> Wide 2D Grid: Rows = Metabolites, Columns = Samples
+            │
+            ▼  EXECUTE: read_and_clean_data() inside R/read.R
+ [State 1: Long Tibble]    --> 5 Structured Columns: metabolite, sample, abundance, io, qc
+            │
+            ▼  EXECUTE: qc_drift_correction() inside R/qc_drift.R
+ [State 2: Calibrated Long]--> Appends calculated coordinate: corrected_abundance
+            │
+            ▼  EXECUTE: normalize_data() inside R/normalize.R
+ [State 3: Scaled Matrix]  --> Appends normalized coordinate: scaled_abundance
+            │
+            ▼  EXECUTE: run_pca() & generate_plots() inside R/pca.R & R/plots.R
+ [State 4: In-Memory Data] --> Fully calibrated, normalized tables & visual validation plots
+```
+
+------------------------------------------------------------------------
+
+## 2. Exhaustive File-by-File Technical Deep Dive
+
+### 2.1 `read.R` - Data Ingestion & Structural Alignment
+
+**Primary Function:** `read_and_clean_data(filepath, sheet_name = 1, qc_starts_with = "QC")`
+
+This file handles initial data loading, coordinate transformations, and primary key validation.
+
+-   **Line-by-Line Mechanics:**
+    -   **`injection_orders <- as.numeric(full_data[1, -1])`**: Extracts the very first row across all sample columns (dropping index 1) and saves it as a clean numeric tracking vector representing the sequential timeline ($io$) of the mass spectrometer run.
+    -   **`full_data <- full_data[-1, ]`**: Strips that tracking header out of the data frame to keep it from corrupting your numerical abundance calculations.
+    -   **`names(full_data)[1] <- "metabolites"`**: Re-indexes the first column to establish a explicit primary key identifier for the molecular features.
+    -   **`full_data$metabolites[...] <- paste(...)`**: Checks for duplicate row entries where a metabolite appears multiple times due to different peak fragments or isomers. It dynamically appends unique trailing suffix tracking flags (e.g., `_1`, `_2`) so rows are never accidentally squashed or lost.
+    -   **`pivot_longer(full_data, -1, names_to = "sample", values_to = "abundance")`**: Transposes the wide matrix grid into a deep, long 3-column layout, making it instantly compatible with fast vector calculations.
+    -   **`mutate(..., qc = grepl(paste0("^", qc_starts_with), sample))`**: Evaluates string headers using regex matching to create a clean boolean column array (`TRUE`/`FALSE`) to isolate your validation standards.
+-   **What it Outputs:** A long-format tibble/data frame with exactly 5 tracking columns: `metabolites`, `sample`, `abundance`, `io`, and `qc`.
+-   **Troubleshooting & Modifications:** If your lab uses different file layouts, ensure that your row sequence numbers are located on line 1, and adapt the prefix argument (e.g., `qc_starts_with = "Pool"` or `"REF"`) to match your exact sample labeling convention.
+
+------------------------------------------------------------------------
+
+### 2.2 `qc_drift.R` - Piecewise Linear Signal Correction
+
+**Primary Functions:** `qc_drift_correction()` and `correct_linear()`
+
+This module isolates and tracks signal decay across runtime sequences by executing targeted calculations exclusively on quality control replicates.
+
+-   **Line-by-Line Mechanics:**
+    -   **`group_by(raw_data, metabolites)`**: Sub-segments your massive data frame by its feature keys, streaming each metabolite independently through the calculation loops.
+    -   **`qc_indeces <- (1:length(qc))[qc]`**: Identifies the exact row index locations where the `qc` boolean column matches `TRUE`.
+    -   **`retval[1] <- mean(abundance[qc_indeces], na.rm = TRUE)`**: Establishes your overall biological baseline target value by averaging the intensities of all QC controls across the entire dataset sequence.
+    -   **`for(i in 2:length(qc_indeces))`**: Loops sequentially through consecutive chronological pairs of your QC checkpoints (anchoring indices $a$ and $b$).
+    -   **`m <- (abundance[b] - abundance[a]) / (io[b] - io[a])`**: Calculates the precise localized linear slope ($m$) of signal decay between those two anchors: $$m = \frac{\text{Abundance}_b - \text{Abundance}_a}{io_b - io_a}$$
+    -   **`pred_val <- (m * (x - io[a]) + abundance[a])`**: Extrapolates a unique, point-by-point predicted signal decay baseline for any biological samples sitting between those two QC points. To prevent division errors if a signal hits absolute zero, dropouts are caught and adjusted to `1e-9`.
+    -   **`retval[(a+1):b] <- abundance[(a+1):b] * (retval[1] / pred_val)`**: Adjusts the raw intensities by multiplying them by the scalar fraction (`Global Mean / Predicted Value`), shifting the attenuated signal cleanly back up to the true baseline.
+-   **What it Outputs:** A tidy long data frame with an appended `corrected_abundance` column, containing values fully adjusted for instrument drift.
+-   **Troubleshooting & Modifications:** If a feature has fewer than 2 valid QC points, the code throws a warning and skips the calculation for that molecule. This protects your downstream matrix from division-by-zero math errors.
+
+------------------------------------------------------------------------
+
+### 2.3 `normalize.R` - Multi-Method Matrix Normalization
+
+**Primary Function:** `normalize_data(corrected_data, method = "tsn")`
+
+This file eliminates variations caused by physical differences in extraction volumes or sample dilutions by applying matrix-wide calculations across sample columns.
+
+-   **Line-by-Line Mechanics:**
+    -   **`pivot_wider(id_cols = metabolites, ...)`**: Temporarily reconstructs your dataset back into a wide cross-tabulated matrix format to run calculations across columns.
+    -   **The Total Sum Normalization (`tsn`) Path:**
+        -   `col_sums <- apply(corrected_wide, 2, sum, na.rm = TRUE)`: Sums every single row value within a column to determine the total signal volume for each individual sample injection.
+        -   `norm_by_sum <- sweep(corrected_wide, 2, col_sums, "/")`: Divides every cell by its corresponding sample column total, scaling intensities into clean fractions of total abundance to remove dilution differences.
+        -   `scaled_data <- sweep(norm_by_sum, 1, row_means, FUN = "*")`: Multiplies features back across rows by their historical mean values, keeping data points in an easily interpretable biological concentration range.
+    -   **The Autoscaling (`auto`) Path:**
+        -   `scale(t(corrected_wide), center = TRUE, scale = TRUE)`: Transposes the sample coordinates and calculates classic standard Z-scores ($Z = \frac{x - \mu}{\sigma}$). Centering shifts the mean of each feature array to exactly zero, while scaling divides by its standard deviation to establish unit variance. This ensures that large-magnitude signals do not overwhelm smaller biological variations in downstream multivariate models.
+-   **What it Outputs:** A tidy long data frame containing an appended column named `scaled_abundance` holding your fully normalized intensities.
+
+------------------------------------------------------------------------
+
+### 2.4 `pca.R` - Multidimensional Dimension Reduction
+
+**Primary Function:** `run_pca(data, vbl)`
+
+This module prepares your data and evaluates your global variance layout using principal component scores.
+
+-   **Line-by-Line Mechanics:**
+    -   **`vars <- apply(mat, 2, var, na.rm=TRUE)`**: Iterates across wide sample grids to calculate the exact statistical variance of each feature vector.
+    -   **`mat <- mat[, vars > 0 & !is.na(vars), drop=FALSE]`**: **The critical safety checker filter.** It scans the data matrix and completely strips out flat, unchanging features or constant dropouts. This explicitly prevents the singular value decomposition engine from running into division-by-zero failures or causing R to crash during matrix derivation.
+    -   **`prcomp(mat, center = TRUE, scale. = TRUE)`**: Projects high-dimensional feature variables into clean, orthogonal principal components ($PC_1, PC_2, \dots$).
+-   **What it Outputs:** A standard `prcomp` class list object containing coordinate projections ($x$), rotation weights, and standard deviation eigenvalues.
+
+------------------------------------------------------------------------
+
+### 2.5 `plots.R` - Diagnostic Quality Assurance Visuals
+
+**Primary Functions:** `generate_pca_plot()`, `generate_cv_plot()`, `generate_qc_violin()`, and `generate_qc_heatmap()`
+
+This module isolates and visualizes your pipeline results using targeted `ggplot2` charts.
+
+-   **Line-by-Line Mechanics & Interpretations:**
+    -   **`generate_pca_plot()`**: Maps principal component coordinates ($PC_1$ vs $PC_2$). If your correction worked properly, your blue reference QC injections will cluster tightly together on the screen.
+    -   **`generate_cv_plot()`**: Calculates precision metrics across replicates ($\%CV = \frac{\sigma}{\mu} \times 100$) and draws a clear horizontal dashed line at the **20%** mark. This allows you to instantly flag any unstable features.
+    -   **`generate_qc_violin()`**: Visualizes data distributions across the timeline using a standard log10 transform, allowing you to instantly check that median values remain aligned.
+    -   **`generate_qc_heatmap()`**: Renders a Z-score intensity matrix layout along your injection sequence. Successful processing is confirmed when all systematic artifact patterns or vertical bands are gone.
+-   **What it Outputs:** Complete, publication-ready `ggplot2` visual objects.
+
+------------------------------------------------------------------------
+
+### 2.6 `master.R` - Monolithic Automation Pipeline Orchestration
+
+**Primary Function:** `process_runs(filepath, sheet_name = 1, norm_method = "tsn", qc_starts_with = "QC")`
+
+-   **What it does:** This is the master coordinator script. Instead of forcing users to execute steps manually, it handles the complete sequential data stream in memory behind the scenes.
+-   **How it connects your files:**
+    1.  It calls `read_and_clean_data()` (`read.R`) to ingest and structure the file.
+    2.  It passes that structured output straight into `qc_drift_correction()` (`qc_drift.R`) to remove runtime bias.
+    3.  It routes the drift-corrected values directly to `normalize_data()` (`normalize.R`) to handle sample dilutions.
+    4.  It passes the final matrices into your `run_pca()` (`pca.R`) and plotting functions (`plots.R`).
+-   **What it Outputs:** A comprehensive master tracking list containing sub-elements `$data$raw`, `$data$corrected`, `$data$scaled`, and your full collection of diagnostic plots inside `$plots`.
+
+------------------------------------------------------------------------
+
+## 3. Post-Analysis Processing & Exporting
+
+Once data processing wraps up, you can easily pull your cleaned long tables out of R and write them back onto your local storage disk as standard CSV spreadsheets:
+
+```{r step6-export, eval=FALSE}
+# Extract your fully processed data frame into active workspace memory
+final_analytical_data <- normalized_data
+
+# Inspect finalized dataset dimensions and structure
+print(dim(final_analytical_data))
+print(head(final_analytical_data))
+```
+
+------------------------------------------------------------------------
+
+## 4. End-to-End Chronological Tutorial Workspace
+
+Copy this template into your workspace, define your local file targets, and run your pipeline components end-to-end.
+
+```{r dynamic-execution, message=FALSE, warning=FALSE, eval=FALSE}
+library(devtools)
+load_all()
+
+# 1. Define the path to your real experimental Excel file
+real_data_path <- "inst/extdata/RawMassSpec.xlsx"
+
+# 2. Establish dynamic file and processing parameters
+target_sheet <- 1           # Target tab index or name
+qc_prefix    <- "QC"        # Label flag pattern for QC references
+norm_choice  <- "tsn"       # Normalization calculation ("tsn" or "auto")
+
+# 3. Step-by-Step Chronological Pipeline Execution
+# Step A: Load, clean, and transpose raw files
+raw_data <- read_and_clean_data(
+  filepath = real_data_path, 
+  sheet_name = target_sheet, 
+  qc_starts_with = qc_prefix
+)
+
+# Step B: Model and eliminate time-dependent analytical drift
+corrected_data <- qc_drift_correction(raw_data)
+
+# Step C: Normalize values to handle physical sample dilution variances
+normalized_data <- normalize_data(corrected_data, method = norm_choice)
+
+# 4. Generate Diagnostic Visual Controls
+pca_output <- run_pca(data = normalized_data, vbl = scaled_abundance)
+pca_plot   <- generate_pca_plot(pcs = pca_output, title_prefix = "Onboarding Guide")
+cv_plot    <- generate_cv_plot(data = normalized_data, vbl = scaled_abundance)
+
+print(pca_plot)
+print(cv_plot)
+
+# 5. Save Finished Deliverables Back to Local Disk Storage
+write.csv(
+  normalized_data, 
+  file = "outputs/normalized_metabolomics_results.csv", 
+  row.names = FALSE
+)
+```
+
+# Complete-step-by-step-pipeline
+
+#### *Global Pipeline Architecture*
+
+High-dimensional mass spectrometry (MS) datasets are inherently prone to systematic artifacts. These are caused by target signal dropouts (analytical drift) over long injection sequences and sample concentration variances (dilution effects). The qcdrift package resolves these variations using a chronological, modular processing layout.
+
+#### STEP 1: Environment Initialization & Parameter Configuration
+
+-   ***What It Is***: Prepares your workspace and sets project variables.
+
+-   ***Why It Is:*** To attach source code modifications directly from your development folders into active memory without requiring a full reinstall.
+
+-   ***What It Does***: Loads essential developer packages, attaches package functions,and establishes file targets and naming prefixes.
+
+**VARIABLE DIRECTORY:**
+
+-   **target_sheet (Numeric/String)**: The discrete tab position index or sheet name where the raw matrix resides.
+
+-   **qc_prefix (String)**: The regular expression text pattern used to match and label instrument quality control injections.
+
+-   **norm_choice (String)**: USER CHOICE - Set to "tsn" for Total Sum Normalization or "auto" for Autoscaling (Z-scores).
+
+```{r STEP 1, eval=FALSE}
+
+library(devtools)
+load_all()
+
+# Establish localized parameters matching your experimental design
+target_sheet   <- 1           
+qc_prefix      <- "QC"        
+
+# DYNAMIC USER CHOICE: Set to "tsn" for Total Sum Normalization or "auto" for Autoscaling
+norm_choice    <- "tsn"
+
+```
+
+#### STEP 1B: Bundled Example Data Configuration
+
+-   ***What It Is***: Locates the built-in system file package example.
+
+-   ***Why It Is*****:** Instead of hardcoding a local desktop file path (which will break on a colleague's computer), system.file() finds the absolute path inside the installed package environment dynamically.
+
+-   ***What It Does***: Searches your package data directory for "RawMassSpec.xlsx", verifies its installation presence, and returns a local system string path that read_and_clean_data() can instantly ingest.
+
+**VARIABLE DIRECTORY:**
+
+-   **real_data_path (String) :** Dynamically resolved absolute local file path tageting the embedded spreadsheet.
+
+```{r STEP 1, eval=FALSE}
+# Dynamically locate the embedded Excel file within the installed package
+real_data_path <- system.file(
+  "extdata", 
+  "RawMassSpec.xlsx", 
+  package = "qcdrift"
+)
+
+# Safety Validation Check: Ensure the file was actually found by R
+if (real_data_path == "") {
+  stop("Example file 'RawMassSpec.xlsx' not found inside inst/extdata/. Check your package structure!")
+}
+
+```
+
+#### STEP 2: Data Ingestion & Structural Realignment (R/read.R)
+
+-   ***What It Is*****:** The parsing gateway that reads raw spreadsheets into memory.
+
+-   ***Why It Is***: Raw mass spec outputs are wide grids that prevent efficient vector calculations or time-series tracking. This module structures data for downstream processing.
+
+-   ***What It Does***: Extracts runtime sequence orders (io), uses regular expressions to flag validation standards (qc), uniquely appends suffixes to duplicate features, and reshapes data into a 5-column long tibble.
+
+**VARIABLE DIRECTORY:**
+
+-   **real_data_path (String) :** Dynamically resolved absolute local file path tageting the embedded spreadsheet.
+
+-   **filepath, sheet_name, qc_starts_with (Arguments):** Internal function entry boundaries mapping straight to your step 1 parameters.
+
+-   **injection_orders (Numeric Vector):** Extracted from row 1; maps the run sequence order (the independent time variable, io).
+
+-   **full_data (Data Frame):** The core matrix. It begins as a wide grid, gets its top row stripped, gets its primary key column named, and mutates dynamically.
+
+-   **raw_data (Data Frame):** The final returned tidy long-format table outputted by this file module.
+
+```{r STEP2, eval=FALSE}
+# Run data ingestion using your verified package data path
+raw_data <- read_and_clean_data( filepath = real_data_path, sheet_name = target_sheet, qc_starts_with = qc_prefix )
+
+# Inspection Checklist: Verify the long matrix coordinate structure
+
+print("Ingestion Complete. Structural Coordinates:") 
+print(head(raw_data))
+```
+
+#### STEP 3: Piecewise Linear Baseline Drift Correction (R/qc_drift.R)
+
+-   ***What It Is*****:** The chronological segment-by-segment interpolation engine.
+
+-   ***Why It Is*****:** To eliminate systematic baseline signal decay caused by natural instrument attenuation, source fouling, and column degradation
+
+-   ***What It Does*****:** Groups data by feature, calculates baseline reference means, tracks interpolation slopes (m) between chronological check pairs, and scales attenuated values back up to match your global target.
+
+**VARIABLE DIRECTORY:**
+
+-   **metabolites (Primary Key Factor):** The grouping variable that acts as a split-apply-combine partition.
+
+-   **qc_indeces (Numeric Vector):** Holds the exact coordinate positions along the timeline where the 'qc' variable equals TRUE.
+
+-   **retval (Numeric Vector):** An internal tracking collector array initialized to gather and transform feature values.
+
+-   **retval[1] (Numeric Scalar):** The global baseline concentration target calculated as the mean intensity of all valid QCs.
+
+-   **a, b (Loop Anchors):** The index markers representing the boundaries of the current localized segment window.
+
+-   **m (Numeric Scalar):** The calculated localized linear slope of signal decay across the current window segment.
+
+-   **pred_val (Numeric Vector):** The extrapolated baseline attenuation line value calculated for samples running between anchors.
+
+-   **corrected_data (Data Frame):** The returned table with an appended column containing values adjusted for instrument drift.
+
+```{r}
+
+corrected_data <- qc_drift_correction( raw_data = raw_data, correction_function = correct_linear )
+
+
+# Inspection Checklist: Confirm 'corrected_abundance' vector is appended
+
+print("Drift Correction Complete. Calibrated Matrix:") 
+print(head(corrected_data))
+
+```
+
+#### STEP 4: Sample-Level Loading & Dilution Normalization (R/normalize.R)
+
+-   ***What It Is*****:** A sample sweeping normalization and matrix alignment tool.
+
+-   ***Why It Is*****:** To account for physical differences in initial pipetting steps, sample volume changes, and physical dilution artifacts.
+
+-   ***What It Does*****:** Reconstructs a wide cross-tabulated layout, runs column sums to measure loading variances, divides cells by totals to create volume fractions, and multi-scales back by feature averages.
+
+**VARIABLE DIRECTORY:**
+
+-   **method (Argument):** Internal toggle routing execution logic down either the total sum or autoscale calculation pathways.
+
+-   **corrected_wide (Matrix):** Temporary data frame storing feature variables as rows and sample sequences as columns.
+
+-   **col_sums (Numeric Vector):** Tracks total cumulative ion intensity per column, quantifying dilution variance per sample injection.
+
+-   **norm_by_sum (Matrix):** Intermediate array where columns represent normalized fractions of total abundance.
+
+-   **row_means (Numeric Vector):** Holds the baseline average concentration of each feature row across all injections.
+
+-   **scaled_data (Matrix/Wide):** Wide format array containing fully normalized, concentration-corrected measurements.
+
+-   **normalized_data (Data Frame):** Final long-format output data table containing your stabilized concentration variables.
+
+```{r}
+
+normalized_data <- normalize_data( corrected_data = corrected_data, method = norm_choice )
+
+# Inspection Checklist: Audit overall statistical data ranges
+
+print("Matrix Normalization Complete. Summary Metrics:") 
+summary(normalized_data$scaled_abundance)
+
+
+```
+
+#### STEP 5: Multidimensional Dimension Reduction & PCA Auditing (R/pca.R)
+
+-   ***What It Is*****:** An orthogonal singular value decomposition compression script.
+
+-   ***Why It Is*****:** To reduce massive variable grids into clear variance vectors,while applying defensive filters to keep the math from crashing.
+
+-   ***What It Does*****:** Evaluates variable-by-variable variance, completely strips out zero-variance flat lines or constant dropouts (vars \> 0), and computes filtered principal components without software crashes.
+
+**VARIABLE DIRECTORY:**
+
+-   **data, vbl (Arguments):** Map the input table and targets variable column (scaled_abundance) down to the logic engine.
+
+-   **mat (Matrix):** A temporary internal sample-by-feature wide coordinate grid generated for standard multidimensional calculations.
+
+-   **vars (Numeric Vector):** Stores the variance value calculated for each metabolite across all batch runs.
+
+-   **pca_output (List/prcomp Object):** The returned list array holding component rotation weights, standard deviation eigenvalues, and coordinate scores.
+
+```{r}
+
+pca_output <- run_pca(
+  data = normalized_data, 
+  vbl  = scaled_abundance
+)
+
+```
+
+#### STEP 6: Diagnostic Visual Control Rendering (R/plots.R)
+
+-   ***What It Is*****:** An automated validation suite built on top of ggplot2.
+
+-   ***Why It Is*****:** To yield clear visual indicators proving technical artifact removal while verifying that true biological signal was preserved.
+
+-   ***What It Does*****:** Generates score plots tracking sample groupings and precision distribution profiles relative to a horizontal 20% limit barm
+
+**VARIABLE DIRECTORY:**
+
+-   **pcs (Argument):** Entry gate accepting the prcomp list object to extract spatial coordinates.
+
+-   **title_prefix (String):** Sets text labels on chart titles to differentiate tutorial stages.
+
+-   **pca_plot (ggplot Object):** High-resolution plot coordinate mapping principal component scores.
+
+-   **cv_plot (ggplot Object):** Precision waterfall plot checking feature reproducibility against standard thresholds.
+
+```{r}
+pca_plot <- generate_pca_plot(pcs = pca_output, title_prefix = "Workspace Tutorial") 
+cv_plot <- generate_cv_plot(data = normalized_data, vbl = scaled_abundance)
+
+# Display charts immediately on your active RStudio plotting frame panel
+
+print(pca_plot) 
+print(cv_plot)
+```
+
+#### STEP 7: Analytical Dataset Finalization (R/utils.R)
+
+-   ***What It Is*****:** The analytical dataset extraction and memory finalization module.
+
+-   ***Why It Is*****:** To package the finished matrix data arrays directly inside the active R session, converting them into clean, structured formats ready for immediate downstream statistical modeling without writing intermediate files to disk.
+
+-   ***What It Does*****:**Isolates the stabilized concentration coordinates, verifies data matrix dimensions, and returns a finalized, reproducible long-format tibble ready for workspace analysis.
+
+**VARIABLE DIRECTORY:**
+
+-   **final_analytical_data (Data Frame):** The primary long-format output data table storing finalized, drift-corrected, and normalized metabolite concentrations.
+
+```{r}
+# Extract the finalized analytical data frame in active session memory
+final_analytical_data <- normalized_data
+
+# Inspection Checklist: Verify dimensions and preview final analytical coordinates
+print("Pipeline Processing Complete! Matrix Dimensions:")
+print(dim(final_analytical_data))
+
+print("Final Deliverable Matrix Coordinates:")
+print(head(final_analytical_data))
+
+```
